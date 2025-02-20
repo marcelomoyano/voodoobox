@@ -295,19 +295,23 @@ func createSettingEngine(isWHIP bool, udpMuxCache map[int]*ice.MultiUDPMuxDefaul
 }
 
 func PopulateMediaEngine(m *webrtc.MediaEngine) error {
-	for _, codec := range []webrtc.RTPCodecParameters{
-		{
-			// nolint
-			RTPCodecCapability: webrtc.RTPCodecCapability{webrtc.MimeTypeOpus, 48000, 2, "minptime=10;useinbandfec=1", nil},
-			PayloadType:        111,
-		},
-	} {
-		if err := m.RegisterCodec(codec, webrtc.RTPCodecTypeAudio); err != nil {
-			return err
-		}
+	// Configure audio codec with our quality settings
+	audioCodec := webrtc.RTPCodecCapability{
+		MimeType:    webrtc.MimeTypeOpus,
+		ClockRate:   uint32(currentConfig.AudioQuality.SampleRate),
+		Channels:    uint16(currentConfig.AudioQuality.Channels),
+		SDPFmtpLine: buildAudioFmtpLine(),
 	}
 
-	for _, codecDetails := range []struct {
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: audioCodec,
+		PayloadType:        111,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
+		return err
+	}
+
+	// Define all available video codecs
+	videoCodecs := []struct {
 		payloadType uint8
 		mimeType    string
 		sdpFmtpLine string
@@ -321,35 +325,69 @@ func PopulateMediaEngine(m *webrtc.MediaEngine) error {
 		{98, webrtc.MimeTypeVP9, "profile-id=0"},
 		{100, webrtc.MimeTypeVP9, "profile-id=2"},
 		{113, webrtc.MimeTypeH265, "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST"},
-	} {
-		if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-			RTPCodecCapability: webrtc.RTPCodecCapability{
-				MimeType:     codecDetails.mimeType,
-				ClockRate:    90000,
-				Channels:     0,
-				SDPFmtpLine:  codecDetails.sdpFmtpLine,
-				RTCPFeedback: videoRTCPFeedback,
-			},
-			PayloadType: webrtc.PayloadType(codecDetails.payloadType),
-		}, webrtc.RTPCodecTypeVideo); err != nil {
-			return err
-		}
+	}
 
-		if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-			RTPCodecCapability: webrtc.RTPCodecCapability{
-				MimeType:     "video/rtx",
-				ClockRate:    90000,
-				Channels:     0,
-				SDPFmtpLine:  fmt.Sprintf("apt=%d", codecDetails.payloadType),
-				RTCPFeedback: nil,
-			},
-			PayloadType: webrtc.PayloadType(codecDetails.payloadType + 1),
-		}, webrtc.RTPCodecTypeVideo); err != nil {
-			return err
+	// Add x-google-max-bitrate parameter to RTCP feedback
+	maxBitrate := fmt.Sprintf("x-google-max-bitrate=%d", currentConfig.MaxBitrate)
+	rtcpFeedback := append(videoRTCPFeedback, webrtc.RTCPFeedback{"", maxBitrate})
+
+	// Register codecs in preferred order
+	for _, preferredCodec := range currentConfig.PreferredCodecs {
+		for _, codecDetails := range videoCodecs {
+			if codecDetails.mimeType == preferredCodec {
+				if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+					RTPCodecCapability: webrtc.RTPCodecCapability{
+						MimeType:     codecDetails.mimeType,
+						ClockRate:    90000,
+						Channels:     0,
+						SDPFmtpLine:  codecDetails.sdpFmtpLine,
+						RTCPFeedback: rtcpFeedback,
+					},
+					PayloadType: webrtc.PayloadType(codecDetails.payloadType),
+				}, webrtc.RTPCodecTypeVideo); err != nil {
+					return err
+				}
+
+				// Register RTX codec for the current codec
+				if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+					RTPCodecCapability: webrtc.RTPCodecCapability{
+						MimeType:     "video/rtx",
+						ClockRate:    90000,
+						Channels:     0,
+						SDPFmtpLine:  fmt.Sprintf("apt=%d", codecDetails.payloadType),
+						RTCPFeedback: nil,
+					},
+					PayloadType: webrtc.PayloadType(codecDetails.payloadType + 1),
+				}, webrtc.RTPCodecTypeVideo); err != nil {
+					return err
+				}
+			}
 		}
 	}
 
 	return nil
+}
+
+// Helper function to build audio FMTP line based on configuration
+func buildAudioFmtpLine() string {
+	var params []string
+
+	params = append(params, "minptime=10")
+	params = append(params, "useinbandfec=1")
+
+	if currentConfig.AudioQuality.DisableEchoCancellation {
+		params = append(params, "sprop-stereo=1")
+	}
+
+	if currentConfig.AudioQuality.DisableNoiseSuppression {
+		params = append(params, "usedtx=0")
+	}
+
+	if currentConfig.AudioQuality.DisableAGC {
+		params = append(params, "cbr=1")
+	}
+
+	return strings.Join(params, ";")
 }
 
 func newPeerConnection(api *webrtc.API) (*webrtc.PeerConnection, error) {
